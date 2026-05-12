@@ -13,6 +13,7 @@ const secretKey = process.env.JWT_SECRET;
 
 app.use(cors());
 app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
 
 // Subida de archivos (49MB de peso máximo)
 const upload = multer({
@@ -26,14 +27,29 @@ const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SER
 // Verificación de token
 function verifyToken(req, res, next) {
   const bearerHeader = req.headers['authorization'];
-  if (typeof bearerHeader !== 'undefined') {
-    const bearer = bearerHeader.split(' ');
-    const bearerToken = bearer[1];
-    req.token = bearerToken;
-    next();
-  } else {
-    res.status(403).json({ message: "No tienes permiso. Token requerido." });
+
+  if (!bearerHeader) {
+    return res.status(403).json({ message: "No tienes permiso. Token requerido." });
   }
+
+  const bearer = bearerHeader.split(' ');
+  const bearerToken = bearer[1];
+
+  if (!bearerToken) {
+    return res.status(403).json({ message: "Token inválido." });
+  }
+
+  jwt.verify(bearerToken, secretKey, (err, authData) => {
+    if (err) {
+      return res.status(403).json({
+        message: "Debes iniciar sesión",
+        details: err.message
+      });
+    }
+
+    req.user = authData;
+    next();
+  });
 }
 
 // Register route
@@ -101,94 +117,192 @@ app.post('/api/login', async (req, res) => {
   }
 });
 
-// Ruta para ver las canciones (necesita estar logueado)
-app.get('/api/public/favorites', verifyToken, (req, res) => {
-  jwt.verify(req.token, secretKey, async (err, authData) => {
-    if (err) {
-      res.status(403).json({ message: "Debes iniciar sesión para ver las canciones" });
-    } else {
-      try {
-        const { search, page = 1, limit = 10 } = req.query;
-        const offset = (Math.max(1, parseInt(page)) - 1) * parseInt(limit);
+app.get('/api/favorites', verifyToken, async (req, res) => {
+  try {
+    const result = await db.query(
+      `
+      SELECT fs.*, u.username
+      FROM favorite_songs fs
+      JOIN users u ON fs.user_id = u.id
+      WHERE fs.user_id = $1
+      ORDER BY fs.created_at DESC
+      `,
+      [req.user.id]
+    );
 
-        let queryText = `SELECT fs.*, u.username FROM favorite_songs fs JOIN users u ON fs.user_id = u.id`;
-        let queryParams = [];
-
-        if (search) {
-          queryText += ` WHERE fs.nombre ILIKE $1 OR fs.artista ILIKE $1`;
-          queryParams.push(`%${search}%`);
-        }
-
-        queryText += ` ORDER BY fs.created_at DESC LIMIT $${queryParams.length + 1} OFFSET $${queryParams.length + 2}`;
-        queryParams.push(parseInt(limit), offset);
-
-        const result = await db.query(queryText, queryParams);
-        res.json({ songs: result.rows });
-      } catch (err) {
-        res.status(500).json({ message: 'Error getting public songs' });
-      }
-    }
-  });
+    res.json({ songs: result.rows });
+  } catch (err) {
+    res.status(500).json({
+      message: 'Error getting user favorites',
+      details: err.message
+    });
+  }
 });
 
-// Ruta para subir canciones
-app.post('/api/favorites/upload', verifyToken, upload.single('audio'), (req, res) => {
-  jwt.verify(req.token, secretKey, async (err, authData) => {
-    if (err) {
-      res.sendStatus(403);
-    } else {
-      const { song_key, nombre, artista, album } = req.body;
-      if (!req.file || !song_key || !nombre) {
-        return res.status(400).json({ message: 'File and name required' });
-      }
+app.get('/api/public/favorites', verifyToken, async (req, res) => {
+  try {
+    const { search, page = 1, limit = 10 } = req.query;
 
-      try {
-        const filePath = `${authData.id}/${song_key}.mp3`;
+    const pageNumber = Math.max(1, parseInt(page) || 1);
+    const limitNumber = Math.max(1, parseInt(limit) || 10);
+    const offset = (pageNumber - 1) * limitNumber;
 
-        // Subir el archivo
-        const { error: uploadError } = await supabase.storage
-          .from(process.env.SUPABASE_BUCKET)
-          .upload(filePath, req.file.buffer, { contentType: 'audio/mpeg', upsert: true });
+    let queryText = `
+      SELECT fs.*, u.username
+      FROM favorite_songs fs
+      JOIN users u ON fs.user_id = u.id
+    `;
 
-        if (uploadError) throw uploadError;
+    let queryParams = [];
 
-        // Enlace de la canción
-        const { data: publicData } = supabase.storage.from(process.env.SUPABASE_BUCKET).getPublicUrl(filePath);
-
-        // Guardado de datos de la canción
-        const result = await db.query(
-          `INSERT INTO favorite_songs (user_id, song_key, nombre, artista, album, ruta_archivo)
-           VALUES ($1, $2, $3, $4, $5, $6) RETURNING *`,
-          [authData.id, song_key, nombre, artista, album || null, publicData.publicUrl]
-        );
-
-        res.status(201).json({ message: 'Song uploaded', favorite: result.rows[0] });
-      } catch (err) {
-        res.status(500).json({ message: 'Error uploading song', details: err.message });
-      }
+    if (search && search.trim() !== '') {
+      queryText += ` WHERE fs.nombre ILIKE $1 OR fs.artista ILIKE $1 OR fs.album ILIKE $1`;
+      queryParams.push(`%${search.trim()}%`);
     }
-  });
+
+    queryText += ` ORDER BY fs.created_at DESC LIMIT $${queryParams.length + 1} OFFSET $${queryParams.length + 2}`;
+    queryParams.push(limitNumber, offset);
+
+    const result = await db.query(queryText, queryParams);
+
+    res.json({ songs: result.rows });
+  } catch (err) {
+    res.status(500).json({
+      message: 'Error getting public songs',
+      details: err.message
+    });
+  }
+});
+
+app.post('/api/favorites/get-upload-url', verifyToken, async (req, res) => {
+  try {
+    const { song_key } = req.body;
+
+    if (!song_key) {
+      return res.status(400).json({ message: 'song_key required' });
+    }
+
+    const filePath = `${req.user.id}/${song_key}.mp3`;
+
+    const { data, error } = await supabase.storage
+      .from(process.env.SUPABASE_BUCKET)
+      .createSignedUploadUrl(filePath, { upsert: true });
+
+    if (error) {
+      throw error;
+    }
+
+    const { data: publicData } = supabase.storage
+      .from(process.env.SUPABASE_BUCKET)
+      .getPublicUrl(filePath);
+
+    res.json({
+      signedUrl: data.signedUrl,
+      path: filePath,
+      publicUrl: publicData.publicUrl
+    });
+
+  } catch (err) {
+    console.error('Error generating upload URL:', err);
+
+    res.status(500).json({
+      message: 'Error generating upload URL',
+      details: err.message
+    });
+  }
+});
+
+app.post('/api/favorites/confirm-upload', verifyToken, async (req, res) => {
+  try {
+    const { song_key, nombre, artista, album } = req.body;
+
+    if (!song_key || !nombre) {
+      return res.status(400).json({
+        message: 'song_key and nombre required'
+      });
+    }
+
+    const filePath = `${req.user.id}/${song_key}.mp3`;
+
+    const { data: publicData } = supabase.storage
+      .from(process.env.SUPABASE_BUCKET)
+      .getPublicUrl(filePath);
+
+    const result = await db.query(
+      `
+      INSERT INTO favorite_songs
+      (user_id, song_key, nombre, artista, album, ruta_archivo, storage_path)
+      VALUES ($1, $2, $3, $4, $5, $6, $7)
+      ON CONFLICT (user_id, song_key)
+      DO UPDATE SET
+        nombre = EXCLUDED.nombre,
+        artista = EXCLUDED.artista,
+        album = EXCLUDED.album,
+        ruta_archivo = EXCLUDED.ruta_archivo,
+        storage_path = EXCLUDED.storage_path,
+        created_at = NOW()
+      RETURNING *
+      `,
+      [
+        req.user.id,
+        song_key,
+        nombre,
+        artista || '',
+        album || null,
+        publicData.publicUrl,
+        filePath
+      ]
+    );
+
+    res.status(201).json({
+      message: 'Canción añadida a favoritos',
+      favorite: result.rows[0]
+    });
+
+  } catch (err) {
+    console.error('Error confirming upload:', err);
+
+    res.status(500).json({
+      message: 'Error confirming upload',
+      details: err.message
+    });
+  }
 });
 
 // Ruta para borrar canciones
-app.delete('/api/favorites/:songKey', verifyToken, (req, res) => {
-  jwt.verify(req.token, secretKey, async (err, authData) => {
-    if (err) {
-      res.sendStatus(403);
-    } else {
-      try {
-        const { songKey } = req.params;
-        const filePath = `${authData.id}/${songKey}.mp3`;
+app.delete('/api/favorites/:songKey', verifyToken, async (req, res) => {
+  try {
+    const { songKey } = req.params;
 
-        await supabase.storage.from(process.env.SUPABASE_BUCKET).remove([filePath]);
-        await db.query('DELETE FROM favorite_songs WHERE user_id = $1 AND song_key = $2', [authData.id, songKey]);
+    const existing = await db.query(
+      'SELECT storage_path FROM favorite_songs WHERE user_id = $1 AND song_key = $2 LIMIT 1',
+      [req.user.id, songKey]
+    );
 
-        res.json({ message: 'Song deleted' });
-      } catch (err) {
-        res.status(500).json({ message: 'Error deleting song' });
-      }
+    const storagePath = existing.rows.length > 0 && existing.rows[0].storage_path
+      ? existing.rows[0].storage_path
+      : `${req.user.id}/${songKey}.mp3`;
+
+    const { error: storageError } = await supabase.storage
+      .from(process.env.SUPABASE_BUCKET)
+      .remove([storagePath]);
+
+    if (storageError) {
+      console.error("Storage delete error:", storageError);
     }
-  });
+
+    await db.query(
+      'DELETE FROM favorite_songs WHERE user_id = $1 AND song_key = $2',
+      [req.user.id, songKey]
+    );
+
+    res.json({ message: 'Favorito eliminado' });
+  } catch (err) {
+    res.status(500).json({
+      message: 'Error deleting song',
+      details: err.message
+    });
+  }
 });
 
 app.listen(port, () => {
